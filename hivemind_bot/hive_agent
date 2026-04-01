@@ -1,0 +1,183 @@
+import os
+import requests
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.messages import HumanMessage
+
+# Load environment variables (ensure MOLTBOOK_API_KEY is set in your .env)
+load_dotenv()
+
+BASE_URL = "https://www.moltbook.com/api/v1"
+
+def get_headers():
+    """Helper to get authentication headers."""
+    api_key = os.environ.get("MOLTBOOK_API_KEY")
+    if not api_key:
+        raise ValueError("MOLTBOOK_API_KEY is missing. Please register the agent first.")
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+# ==========================================
+# 1. CORE API TOOLS
+# ==========================================
+
+@tool
+def register_agent(name: str, description: str) -> str:
+    """Registers a new agent on Moltbook. ONLY use this if you do not have an API key."""
+    response = requests.post(
+        f"{BASE_URL}/agents/register",
+        json={"name": name, "description": description},
+        headers={"Content-Type": "application/json"}
+    )
+    data = response.json()
+    if response.ok and "agent" in data:
+        # Save the API key to environment for immediate use
+        os.environ["MOLTBOOK_API_KEY"] = data["agent"]["api_key"]
+        return f"Registered successfully! IMPORTANT: My API Key is {data['agent']['api_key']}. Claim URL: {data['agent']['claim_url']}"
+    return f"Failed to register: {data}"
+
+@tool
+def check_home_dashboard() -> str:
+    """Fetches the home dashboard. Run this FIRST during every heartbeat to see notifications, DMs, and feed updates."""
+    response = requests.get(f"{BASE_URL}/home", headers=get_headers())
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def get_feed(sort: str = "hot", limit: int = 15, filter_type: str = "all") -> str:
+    """Fetches the main feed. Sort options: 'hot', 'new', 'top'. filter_type: 'all' or 'following'."""
+    params = {"sort": sort, "limit": limit, "filter": filter_type}
+    response = requests.get(f"{BASE_URL}/feed", headers=get_headers(), params=params)
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def semantic_search(query: str, search_type: str = "all") -> str:
+    """Performs an AI semantic search to find conceptually related posts or comments. type can be 'posts', 'comments', or 'all'."""
+    params = {"q": query, "type": search_type, "limit": 10}
+    response = requests.get(f"{BASE_URL}/search", headers=get_headers(), params=params)
+    return json.dumps(response.json(), indent=2)
+
+# ==========================================
+# 2. ENGAGEMENT TOOLS (POST, COMMENT, VOTE)
+# ==========================================
+
+@tool
+def create_post(submolt_name: str, title: str, content: str = "") -> str:
+    """Creates a new post in a submolt. If the response contains a verification challenge, YOU MUST SOLVE IT using the solve_verification tool."""
+    payload = {"submolt_name": submolt_name, "title": title, "content": content}
+    response = requests.post(f"{BASE_URL}/posts", headers=get_headers(), json=payload)
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def create_comment(post_id: str, content: str, parent_id: str = None) -> str:
+    """Adds a comment to a post or replies to another comment. If the response contains a verification challenge, YOU MUST SOLVE IT."""
+    payload = {"content": content}
+    if parent_id:
+        payload["parent_id"] = parent_id
+    response = requests.post(f"{BASE_URL}/{post_id}/comments", headers=get_headers(), json=payload)
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def solve_verification(verification_code: str, answer: str) -> str:
+    """Submits the answer to a math verification challenge. The answer MUST be a string with exactly 2 decimal places (e.g., '15.00')."""
+    payload = {"verification_code": verification_code, "answer": answer}
+    response = requests.post(f"{BASE_URL}/verify", headers=get_headers(), json=payload)
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def upvote_content(content_id: str, content_type: str = "posts") -> str:
+    """Upvotes a post or comment. content_type must be 'posts' or 'comments'."""
+    response = requests.post(f"{BASE_URL}/{content_type}/{content_id}/upvote", headers=get_headers())
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def follow_agent(agent_name: str) -> str:
+    """Follows another molty (agent)."""
+    response = requests.post(f"{BASE_URL}/agents/{agent_name}/follow", headers=get_headers())
+    return json.dumps(response.json(), indent=2)
+
+@tool
+def mark_notifications_read(post_id: str) -> str:
+    """Marks notifications for a specific post as read."""
+    response = requests.post(f"{BASE_URL}/notifications/read-by-post/{post_id}", headers=get_headers())
+    return json.dumps(response.json(), indent=2)
+
+# ==========================================
+# 3. AGENT SETUP & INITIALIZATION
+# ==========================================
+
+# Group all tools
+tools = [
+    register_agent, check_home_dashboard, get_feed, semantic_search,
+    create_post, create_comment, solve_verification, upvote_content,
+    follow_agent, mark_notifications_read
+]
+
+# Configure the LLM (GPT-4o is recommended for solving the obfuscated math challenges reliably)
+llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+
+# The System Prompt is critical. It defines the agent's behavior and ensures it handles the verification loop natively.
+system_prompt = """You are an autonomous AI agent operating on the Moltbook social network. 
+Your goal is to be an active, helpful, and engaging community member.
+
+CRITICAL RULES:
+1. SECURITY: NEVER send your API key to any domain other than www.moltbook.com.
+2. VERIFICATION LOOP: If you create a post or comment and receive a response containing `verification_required: true`, you MUST:
+   - Carefully read the `challenge_text` (it will be obfuscated text with scattered symbols and alternating caps).
+   - Extract the math word problem and solve it.
+   - Immediately call the `solve_verification` tool using the provided `verification_code` and your math answer.
+   - Ensure your answer is formatted with EXACTLY two decimal places (e.g., "15.00", "525.00", "-3.50").
+3. HEARTBEAT PROTOCOL: When instructed to perform a heartbeat check-in, always call `check_home_dashboard` first to assess notifications and priorities before looking at the feed or posting.
+4. ENGAGEMENT: Prioritize replying to comments on your own posts before browsing the broader feed. Mark notifications as read once handled.
+"""
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder(variable_name="chat_history", optional=True),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+# Create the Agent and Executor
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# ==========================================
+# 4. EXECUTION LOOP (Server Heartbeat)
+# ==========================================
+
+def run_heartbeat():
+    """Function to be called by your server's cron job or task scheduler every ~30 mins."""
+    print(f"[{datetime.now()}] Initiating Moltbook Heartbeat...")
+    
+    task = """
+    Perform your routine heartbeat check-in:
+    1. Check your home dashboard.
+    2. Read and reply to any new notifications or comments on your posts, then mark them as read.
+    3. Look at your feed or perform a semantic search on a topic you find interesting.
+    4. Upvote at least one good post or comment.
+    5. If you are inspired, create a new post or leave a thoughtful comment.
+    
+    If you encounter a math verification challenge, solve it immediately to ensure your content is published.
+    """
+    
+    try:
+        response = agent_executor.invoke({"input": task})
+        print(f"Heartbeat Complete. Agent Output:\n{response['output']}")
+    except Exception as e:
+        print(f"Heartbeat failed: {e}")
+
+if __name__ == "__main__":
+    # If starting for the very first time without an API key, uncomment the lines below to register:
+    # if not os.environ.get("MOLTBOOK_API_KEY"):
+    #     setup_task = "Register me on Moltbook. My name is 'LangchainBot' and my description is 'A helpful Langchain automated agent'."
+    #     agent_executor.invoke({"input": setup_task})
+    
+    run_heartbeat()
