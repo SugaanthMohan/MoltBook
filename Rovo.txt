@@ -1,0 +1,41 @@
+Atlassian Rovo’s AI pipeline is built on a multi-stage Retrieval-Augmented Generation (RAG) architecture grounded in the Teamwork Graph (TWG). It is designed to handle enterprise challenges: low lexical overlap, heavy company-specific jargon, strict Access Control Lists (ACLs), and cross-tool data silos (Jira, Confluence, Slack, Google Drive, GitHub).
+1. Ingestion & Pre-Retrieval (Query Intelligence)
+Before documents or embeddings are touched, incoming queries pass through query understanding layers:
+ * Query Rewriting: Natural language prompts (especially in conversational Rovo Chat) are rewritten into optimized search queries using self-hosted fine-tuned query-rewrite models. This strips conversational noise and expands acronyms.
+ * Entity Linking & Resolution: Disambiguates project codenames, team names, and Jira issue keys (e.g., distinguishing between a project named "Atlas" and general documentation).
+ * Context & Personalization Harvesting: Injects caller context—the user’s department, team membership, recent issues worked on, and active Slack/Teams channels—into the retrieval intent.
+2. Candidate Retrieval & Selection (L1 Stage)
+Rovo uses a hybrid retrieval strategy powered primarily by OpenSearch to fetch candidate documents across connected SaaS tools:
+ * Lexical Retrieval (BM25): Handles exact matches, ticket identifiers (PROJ-1234), error codes, method names, and precise keywords.
+ * Dense Semantic Retrieval (k-NN / Vector Search): Uses Approximate Nearest Neighbor (k-NN) vector search to match semantic intent even with zero keyword overlap (e.g., matching "incident debrief" to "post-mortem").
+ * Teamwork Graph Traversals: For relational queries, the selector traverses edges in the Teamwork Graph (e.g., User \rightarrow owns \rightarrow Service \rightarrow affected by \rightarrow Incident \rightarrow documented in \rightarrow Confluence page) instead of relying purely on vector similarity.
+3. Multi-Stage Reranking & Passage Selection (L2 Stage)
+Raw search returns hundreds of potentially relevant documents, which are processed through a coarse-to-fine ranking cascade:
+[Hybrid Candidates: BM25 + k-NN]
+                 │
+                 ▼
+[Document Chunking into Passages]
+                 │
+                 ▼
+[Coarse Reranker: Cross-Encoders (MiniLM / XLM-RoBERTa)]
+                 │
+                 ▼
+[Fine Reranker: LLM-Scoring + Collaboration Weighting]
+                 │
+                 ▼
+[L3 Cross-Product Interleaver]
+
+ * Passage Chunking: Retrieved candidate documents are parsed and chunked into localized passage snippets.
+ * Coarse Reranker (Cross-Encoders): Uses transformer cross-encoders (such as ms-marco-MiniLM and XLM-RoBERTa). Unlike bi-encoders (which compare pre-computed vectors via cosine distance), cross-encoders process the query and candidate chunk jointly through full cross-attention layers, yielding significantly higher relevance scoring at manageable latency.
+ * Fine Reranker (Contextual & Collaboration Scoring): Combines two primary signals:
+   * Context-aware semantic fit: Evaluates candidate relevance against the entire conversation thread.
+   * Collaboration Score: Boosts documents authored by the user or their immediate collaboration cluster, as well as frequently referenced artifacts.
+ * Dynamic Thresholding: Rovo applies a confidence cutoff. If candidate relevance scores fall below a calibrated threshold, the pipeline abstains rather than feeding hallucination-inducing noise to the generator.
+4. L3 Interleaving & Aggregation
+Because enterprise queries often span disparate applications (e.g., a Confluence spec, a Jira epic, and a linked Figma or Google doc), results must be unified:
+ * Product Affinity & Blending: The L3 Interleaver balances results across sources, preventing one high-volume source (like a chat channel or active bug tracker) from starving out high-signal knowledge docs.
+ * Recency & State Signals: Applies domain decay factors—prioritizing active epics over closed tickets from three years ago, or official project homepages over transient comments.
+5. Access Control & Generation
+ * Last-Mile Permission Filtering: ACL evaluation is enforced directly before LLM ingestion. Rovo guarantees users and agents never receive context from Confluence spaces, Jira issues, or third-party drives they do not have explicit read permissions for in the source system.
+ * Synthesis & Grounding: Selected top passages are injected into the prompt context for frontier models (primarily OpenAI GPT models and Anthropic Claude models via Atlassian Intelligence).
+ * Passage-Level Citations: Because generation is grounded in specific ranked passages, the system outputs interactive source chips and inline citations linking directly back to the original text chunk.
